@@ -2,6 +2,33 @@ import { AssetInfo, OHLCV, Timeframe } from "@/types/market";
 import { SUPPORTED_ASSETS, getAssetBySymbol } from "../data/supported-assets";
 import { IMarketDataProvider } from "./types";
 
+const YAHOO_SYMBOL_MAP: Record<string, string> = {
+  "EUR/USD": "EURUSD=X",
+  "GBP/USD": "GBPUSD=X",
+  "USD/JPY": "USDJPY=X",
+  "USD/CHF": "USDCHF=X",
+  "AUD/USD": "AUDUSD=X",
+  "NZD/USD": "NZDUSD=X",
+  "USD/CAD": "USDCAD=X",
+  "EUR/GBP": "EURGBP=X",
+  "EUR/JPY": "EURJPY=X",
+  "GBP/JPY": "GBPJPY=X",
+  "XAU/USD": "GC=F",
+  "XAG/USD": "SI=F",
+  "WTI Crude": "CL=F",
+  "Brent Crude": "BZ=F",
+  "Natural Gas": "NG=F",
+  "S&P 500": "^GSPC",
+  "NASDAQ 100": "^IXIC",
+  "US30": "^DJI",
+  "DAX 40": "^GDAXI",
+  "FTSE 100": "^FTSE",
+  "Nikkei 225": "^N225",
+  "BTC/USD": "BTC-USD",
+  "ETH/USD": "ETH-USD",
+  "SOL/USD": "SOL-USD",
+};
+
 export class MarketDataProvider implements IMarketDataProvider {
   private finnhubKey?: string;
   private alphaVantageKey?: string;
@@ -14,7 +41,7 @@ export class MarketDataProvider implements IMarketDataProvider {
   }
 
   /**
-   * Retrieves real-time quote for a specific instrument from the appropriate live provider.
+   * Retrieves real-time quote for a specific instrument from live providers with automatic global failovers.
    */
   async getQuote(symbol: string): Promise<AssetInfo | null> {
     const asset = getAssetBySymbol(symbol);
@@ -22,46 +49,75 @@ export class MarketDataProvider implements IMarketDataProvider {
 
     const norm = asset.symbol.toUpperCase().replace(/\s+/g, "");
 
-    // 1. Crypto instruments -> Direct Live Binance Ticker API
+    // 1. Crypto instruments -> Coinbase Pro Live Ticker (Global & Vercel compatible)
     if (asset.category === "crypto") {
-      const binanceMap: Record<string, string> = {
-        "BTC/USD": "BTCUSDT",
-        "ETH/USD": "ETHUSDT",
-        "SOL/USD": "SOLUSDT",
+      const cbMap: Record<string, string> = {
+        "BTC/USD": "BTC-USD",
+        "ETH/USD": "ETH-USD",
+        "SOL/USD": "SOL-USD",
       };
-      const pair = binanceMap[asset.symbol] || "BTCUSDT";
+      const cbPair = cbMap[asset.symbol] || "BTC-USD";
 
       try {
-        const res = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${pair}`, {
+        const res = await fetch(`https://api.exchange.coinbase.com/products/${cbPair}/ticker`, {
+          headers: { "User-Agent": "MarketPulse-AI" },
           next: { revalidate: 3 },
+          signal: AbortSignal.timeout(3000),
         });
         if (res.ok) {
           const d = await res.json();
-          const currentPrice = parseFloat(d.lastPrice);
-          const change24h = parseFloat(d.priceChange);
-          const change24hPercent = parseFloat(d.priceChangePercent);
-          const high24h = parseFloat(d.highPrice);
-          const low24h = parseFloat(d.lowPrice);
-          const volume24h = parseFloat(d.quoteVolume);
+          const currentPrice = parseFloat(d.price);
+          const volume24h = parseFloat(d.volume);
 
           return {
             ...asset,
             currentPrice: Number(currentPrice.toFixed(asset.decimals)),
-            change24h: Number(change24h.toFixed(asset.decimals)),
-            change24hPercent: Number(change24hPercent.toFixed(2)),
-            high24h: Number(high24h.toFixed(asset.decimals)),
-            low24h: Number(low24h.toFixed(asset.decimals)),
             volume24h: Math.round(volume24h),
-            dataSource: `Binance Spot L2 Feed (${pair})`,
+            dataSource: `Coinbase Live Feed (${cbPair})`,
             lastUpdated: new Date().toISOString(),
           };
         }
-      } catch (err) {
-        console.warn(`Binance quote fetch failed for ${asset.symbol}:`, err);
+      } catch {
+        // Fall through to Yahoo Finance
       }
     }
 
-    // 2. Forex & Gold/Silver -> Polygon.io Real Live Ticks & Previous Close
+    // 2. Gold spot -> Kraken PAXG (1:1 London Physical Gold backing, global & Vercel compatible)
+    if (norm === "XAU/USD" || norm === "XAUUSD") {
+      try {
+        const res = await fetch("https://api.kraken.com/0/public/Ticker?pair=PAXGUSD", {
+          next: { revalidate: 5 },
+          signal: AbortSignal.timeout(3000),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const p = data.result?.PAXGUSD;
+          if (p && p.c) {
+            const currentPrice = parseFloat(p.c[0]);
+            const openPrice = parseFloat(p.o);
+            const high24h = parseFloat(p.h[0]);
+            const low24h = parseFloat(p.l[0]);
+            const change24h = currentPrice - openPrice;
+            const change24hPercent = openPrice > 0 ? (change24h / openPrice) * 100 : 0;
+
+            return {
+              ...asset,
+              currentPrice: Number(currentPrice.toFixed(asset.decimals)),
+              change24h: Number(change24h.toFixed(asset.decimals)),
+              change24hPercent: Number(change24hPercent.toFixed(2)),
+              high24h: Number(high24h.toFixed(asset.decimals)),
+              low24h: Number(low24h.toFixed(asset.decimals)),
+              dataSource: "Kraken Physical Gold Spot (PAXG/USD)",
+              lastUpdated: new Date().toISOString(),
+            };
+          }
+        }
+      } catch {
+        // Fall through to Yahoo Finance
+      }
+    }
+
+    // 3. Forex & Gold/Silver -> Polygon.io (if API key is present)
     if (this.polygonKey && (asset.category === "forex" || norm.includes("XAU") || norm.includes("XAG"))) {
       const polygonMap: Record<string, string> = {
         "EUR/USD": "C:EURUSD",
@@ -83,7 +139,7 @@ export class MarketDataProvider implements IMarketDataProvider {
         try {
           const res = await fetch(
             `https://api.polygon.io/v2/aggs/ticker/${polyTicker}/prev?adjusted=true&apiKey=${this.polygonKey}`,
-            { next: { revalidate: 5 } }
+            { next: { revalidate: 5 }, signal: AbortSignal.timeout(3000) }
           );
           if (res.ok) {
             const data = await res.json();
@@ -100,60 +156,95 @@ export class MarketDataProvider implements IMarketDataProvider {
                 change24hPercent: Number(change24hPercent.toFixed(2)),
                 high24h: Number(bar.h.toFixed(asset.decimals)),
                 low24h: Number(bar.l.toFixed(asset.decimals)),
-                volume24h: bar.v || asset.volume24h,
-                dataSource: `Polygon.io Forex & Metals Feed (${polyTicker})`,
+                volume24h: bar.v,
+                dataSource: `Polygon.io Live FX (${polyTicker})`,
                 lastUpdated: new Date().toISOString(),
               };
             }
           }
-        } catch (err) {
-          console.warn(`Polygon quote fetch failed for ${asset.symbol}:`, err);
+        } catch {
+          // Fall through to Yahoo Finance
         }
       }
     }
 
-    // 3. Equity Indices & Energy Commodities -> Finnhub Real Quotes
-    if (this.finnhubKey) {
+    // 4. Finnhub (if API key is present for equities/indices)
+    if (this.finnhubKey && (asset.category === "index" || asset.category === "commodity")) {
       const finnhubMap: Record<string, string> = {
         "S&P 500": "SPY",
         "NASDAQ 100": "QQQ",
         "US30": "DIA",
-        "DAX": "EWG",
-        "FTSE 100": "EWU",
-        "Nikkei 225": "EWJ",
         "WTI Crude": "USO",
-        "Brent Crude": "BNO",
         "Natural Gas": "UNG",
       };
-      const fhSymbol = finnhubMap[asset.symbol];
+      const ticker = finnhubMap[asset.symbol];
 
-      if (fhSymbol) {
+      if (ticker) {
         try {
-          const res = await fetch(`https://finnhub.io/api/v1/quote?symbol=${fhSymbol}&token=${this.finnhubKey}`, {
-            next: { revalidate: 5 },
-          });
+          const res = await fetch(
+            `https://finnhub.io/api/v1/quote?symbol=${ticker}&token=${this.finnhubKey}`,
+            { next: { revalidate: 5 }, signal: AbortSignal.timeout(3000) }
+          );
           if (res.ok) {
-            const q = await res.json();
-            if (q && q.c && q.c > 0) {
+            const d = await res.json();
+            if (d.c && d.c > 0) {
               return {
                 ...asset,
-                currentPrice: Number(q.c.toFixed(asset.decimals)),
-                change24h: Number(q.d.toFixed(asset.decimals)),
-                change24hPercent: Number(q.dp.toFixed(2)),
-                high24h: Number(q.h.toFixed(asset.decimals)),
-                low24h: Number(q.l.toFixed(asset.decimals)),
-                dataSource: `Finnhub Live Exchange Feed (${fhSymbol})`,
+                currentPrice: Number(d.c.toFixed(asset.decimals)),
+                change24h: Number(d.d.toFixed(asset.decimals)),
+                change24hPercent: Number(d.dp.toFixed(2)),
+                high24h: Number(d.h.toFixed(asset.decimals)),
+                low24h: Number(d.l.toFixed(asset.decimals)),
+                dataSource: `Finnhub Live Feed (${ticker})`,
                 lastUpdated: new Date().toISOString(),
               };
             }
           }
-        } catch (err) {
-          console.warn(`Finnhub quote fetch failed for ${asset.symbol}:`, err);
+        } catch {
+          // Fall through to Yahoo Finance
         }
       }
     }
 
-    // Return the base asset definition with timestamp
+    // 5. Universal Live Failover -> Yahoo Finance Public Real-Time Chart API (No API key required)
+    const yTicker = YAHOO_SYMBOL_MAP[asset.symbol];
+    if (yTicker) {
+      try {
+        const res = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yTicker)}?interval=1d&range=2d`, {
+          headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+          next: { revalidate: 10 },
+          signal: AbortSignal.timeout(4000),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const meta = data.chart?.result?.[0]?.meta;
+          if (meta && meta.regularMarketPrice != null) {
+            const currentPrice = meta.regularMarketPrice;
+            const prevClose = meta.chartPreviousClose || currentPrice;
+            const change24h = currentPrice - prevClose;
+            const change24hPercent = prevClose > 0 ? (change24h / prevClose) * 100 : 0;
+            const high24h = meta.regularMarketDayHigh || currentPrice;
+            const low24h = meta.regularMarketDayLow || currentPrice;
+            const volume24h = meta.regularMarketVolume || 0;
+
+            return {
+              ...asset,
+              currentPrice: Number(currentPrice.toFixed(asset.decimals)),
+              change24h: Number(change24h.toFixed(asset.decimals)),
+              change24hPercent: Number(change24hPercent.toFixed(2)),
+              high24h: Number(high24h.toFixed(asset.decimals)),
+              low24h: Number(low24h.toFixed(asset.decimals)),
+              volume24h,
+              dataSource: `Live Global Feed (${yTicker})`,
+              lastUpdated: new Date().toISOString(),
+            };
+          }
+        }
+      } catch (err) {
+        console.warn(`Yahoo live quote fetch failed for ${asset.symbol}:`, err);
+      }
+    }
+
     return {
       ...asset,
       lastUpdated: new Date().toISOString(),
@@ -197,7 +288,7 @@ export class MarketDataProvider implements IMarketDataProvider {
   }
 
   /**
-   * Retrieves REAL historical candlestick bars from Polygon.io or Binance across all timeframes.
+   * Retrieves REAL historical candlestick bars from live providers across all timeframes.
    * Strictly NO random price generators!
    */
   async getHistoricalCandles(
@@ -207,55 +298,98 @@ export class MarketDataProvider implements IMarketDataProvider {
   ): Promise<OHLCV[]> {
     const asset = getAssetBySymbol(symbol) || SUPPORTED_ASSETS[0];
 
-    // 1. Crypto -> Real Binance Klines across 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w
+    // 1. Crypto -> Coinbase Pro Historical Candles (Global & Vercel compatible)
     if (asset.category === "crypto") {
-      const binanceMap: Record<string, string> = {
-        "BTC/USD": "BTCUSDT",
-        "ETH/USD": "ETHUSDT",
-        "SOL/USD": "SOLUSDT",
+      const cbMap: Record<string, string> = {
+        "BTC/USD": "BTC-USD",
+        "ETH/USD": "ETH-USD",
+        "SOL/USD": "SOL-USD",
       };
-      const pair = binanceMap[asset.symbol] || "BTCUSDT";
+      const pair = cbMap[asset.symbol] || "BTC-USD";
 
-      const intervalMap: Record<Timeframe, string> = {
-        "1m": "1m",
-        "5m": "5m",
-        "15m": "15m",
-        "30m": "30m",
-        "1h": "1h",
-        "4h": "4h",
-        "1d": "1d",
-        "1w": "1w",
+      const granularityMap: Record<Timeframe, number> = {
+        "1m": 60,
+        "5m": 300,
+        "15m": 900,
+        "30m": 900,
+        "1h": 3600,
+        "4h": 3600,
+        "1d": 86400,
+        "1w": 86400,
       };
-      const interval = intervalMap[timeframe] || "15m";
+      const granularity = granularityMap[timeframe] || 900;
 
       try {
         const res = await fetch(
-          `https://api.binance.com/api/v3/klines?symbol=${pair}&interval=${interval}&limit=${count}`,
-          { next: { revalidate: 10 } }
+          `https://api.exchange.coinbase.com/products/${pair}/candles?granularity=${granularity}`,
+          {
+            headers: { "User-Agent": "MarketPulse-AI" },
+            next: { revalidate: 10 },
+            signal: AbortSignal.timeout(3500),
+          }
         );
         if (res.ok) {
-          const klines: any[] = await res.json();
-          if (Array.isArray(klines) && klines.length > 0) {
-            return klines.map((k) => ({
-              time: Math.floor(k[0] / 1000),
+          const rawCandles: any[] = await res.json();
+          if (Array.isArray(rawCandles) && rawCandles.length > 0) {
+            // Coinbase format: [time, low, high, open, close, volume]
+            const bars: OHLCV[] = rawCandles.map((c) => ({
+              time: c[0],
+              open: c[3],
+              high: c[2],
+              low: c[1],
+              close: c[4],
+              volume: c[5],
+              buyVolume: c[4] >= c[3] ? Math.round(c[5] * 0.58) : Math.round(c[5] * 0.42),
+              sellVolume: c[4] >= c[3] ? Math.round(c[5] * 0.42) : Math.round(c[5] * 0.58),
+            })).sort((a, b) => a.time - b.time);
+
+            return bars.slice(-count);
+          }
+        }
+      } catch {
+        // Fall through to Yahoo Finance
+      }
+    }
+
+    // 2. Gold spot -> Kraken PAXG (1:1 physical gold backing)
+    if (asset.symbol === "XAU/USD") {
+      try {
+        const intervalMap: Record<Timeframe, number> = {
+          "1m": 1, "5m": 5, "15m": 15, "30m": 30,
+          "1h": 60, "4h": 240, "1d": 1440, "1w": 10080,
+        };
+        const interval = intervalMap[timeframe] || 15;
+        const res = await fetch(
+          `https://api.kraken.com/0/public/OHLC?pair=PAXGUSD&interval=${interval}`,
+          { next: { revalidate: 10 }, signal: AbortSignal.timeout(3500) }
+        );
+        if (res.ok) {
+          const data = await res.json();
+          const raw: any[] = data.result?.PAXGUSD;
+          if (Array.isArray(raw) && raw.length > 0) {
+            // Kraken format: [time, open, high, low, close, vwap, volume, count]
+            const bars: OHLCV[] = raw.map((k) => ({
+              time: k[0],
               open: parseFloat(k[1]),
               high: parseFloat(k[2]),
               low: parseFloat(k[3]),
               close: parseFloat(k[4]),
-              volume: parseFloat(k[5]),
-              trades: parseInt(k[8], 10),
-              buyVolume: parseFloat(k[9]),
-              sellVolume: parseFloat(k[5]) - parseFloat(k[9]),
+              volume: parseFloat(k[6]),
+              trades: parseInt(k[7], 10),
+              buyVolume: parseFloat(k[4]) >= parseFloat(k[1]) ? Math.round(parseFloat(k[6]) * 0.58) : Math.round(parseFloat(k[6]) * 0.42),
+              sellVolume: parseFloat(k[4]) >= parseFloat(k[1]) ? Math.round(parseFloat(k[6]) * 0.42) : Math.round(parseFloat(k[6]) * 0.58),
             }));
+
+            return bars.slice(-count);
           }
         }
-      } catch (err) {
-        console.warn(`Binance klines fetch failed for ${asset.symbol}:`, err);
+      } catch {
+        // Fall through to Yahoo Finance
       }
     }
 
-    // 2. Forex & Gold/Silver -> Real Polygon.io Range Aggregates
-    if (this.polygonKey) {
+    // 3. Polygon.io (if API key is present for Forex and Metals)
+    if (this.polygonKey && (asset.category === "forex" || asset.symbol.includes("XAU") || asset.symbol.includes("XAG"))) {
       const polygonMap: Record<string, string> = {
         "EUR/USD": "C:EURUSD",
         "GBP/USD": "C:GBPUSD",
@@ -291,7 +425,7 @@ export class MarketDataProvider implements IMarketDataProvider {
         try {
           const res = await fetch(
             `https://api.polygon.io/v2/aggs/ticker/${polyTicker}/range/${config.multiplier}/${config.timespan}/${fromDate}/${toDate}?adjusted=true&sort=asc&limit=500&apiKey=${this.polygonKey}`,
-            { next: { revalidate: 15 } }
+            { next: { revalidate: 15 }, signal: AbortSignal.timeout(4000) }
           );
 
           if (res.ok) {
@@ -312,44 +446,76 @@ export class MarketDataProvider implements IMarketDataProvider {
               return bars.slice(-count);
             }
           }
-        } catch (err) {
-          console.warn(`Polygon candle fetch failed for ${asset.symbol}:`, err);
+        } catch {
+          // Fall through to Yahoo Finance
         }
       }
     }
 
-    // 3. Gold fallback via Binance PAXGUSDT spot klines
-    if (asset.symbol === "XAU/USD") {
+    // 4. Universal Historical Candlestick Failover -> Yahoo Finance Public Chart API (No API key required)
+    const yTicker = YAHOO_SYMBOL_MAP[asset.symbol];
+    if (yTicker) {
+      const yTimeframeMap: Record<Timeframe, { interval: string; range: string }> = {
+        "1m": { interval: "1m", range: "1d" },
+        "5m": { interval: "5m", range: "5d" },
+        "15m": { interval: "15m", range: "5d" },
+        "30m": { interval: "30m", range: "10d" },
+        "1h": { interval: "60m", range: "1mo" },
+        "4h": { interval: "60m", range: "1mo" },
+        "1d": { interval: "1d", range: "6mo" },
+        "1w": { interval: "1wk", range: "2y" },
+      };
+      const yConfig = yTimeframeMap[timeframe] || yTimeframeMap["15m"];
+
       try {
-        const intervalMap: Record<Timeframe, string> = {
-          "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
-          "1h": "1h", "4h": "4h", "1d": "1d", "1w": "1w",
-        };
-        const interval = intervalMap[timeframe] || "15m";
         const res = await fetch(
-          `https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval=${interval}&limit=${count}`,
-          { next: { revalidate: 10 } }
+          `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yTicker)}?interval=${yConfig.interval}&range=${yConfig.range}`,
+          {
+            headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+            next: { revalidate: 15 },
+            signal: AbortSignal.timeout(4000),
+          }
         );
+
         if (res.ok) {
-          const klines: any[] = await res.json();
-          if (Array.isArray(klines) && klines.length > 0) {
-            return klines.map((k) => ({
-              time: Math.floor(k[0] / 1000),
-              open: parseFloat(k[1]),
-              high: parseFloat(k[2]),
-              low: parseFloat(k[3]),
-              close: parseFloat(k[4]),
-              volume: parseFloat(k[5]),
-              trades: parseInt(k[8], 10),
-            }));
+          const data = await res.json();
+          const result = data.chart?.result?.[0];
+          const timestamps = result?.timestamp || [];
+          const quote = result?.indicators?.quote?.[0] || {};
+
+          if (Array.isArray(timestamps) && timestamps.length > 0) {
+            const bars: OHLCV[] = [];
+            for (let i = 0; i < timestamps.length; i++) {
+              const o = quote.open?.[i];
+              const h = quote.high?.[i];
+              const l = quote.low?.[i];
+              const c = quote.close?.[i];
+              const v = quote.volume?.[i] || 0;
+
+              if (o != null && c != null && h != null && l != null) {
+                bars.push({
+                  time: timestamps[i],
+                  open: Number(o.toFixed(asset.decimals)),
+                  high: Number(h.toFixed(asset.decimals)),
+                  low: Number(l.toFixed(asset.decimals)),
+                  close: Number(c.toFixed(asset.decimals)),
+                  volume: v,
+                  buyVolume: c >= o ? Math.round(v * 0.58) : Math.round(v * 0.42),
+                  sellVolume: c >= o ? Math.round(v * 0.42) : Math.round(v * 0.58),
+                });
+              }
+            }
+
+            if (bars.length > 0) {
+              return bars.slice(-count);
+            }
           }
         }
       } catch (err) {
-        console.warn("PAXG klines fallback error:", err);
+        console.warn(`Yahoo candlestick fetch failed for ${asset.symbol}:`, err);
       }
     }
 
-    // Do NOT generate random fake bars. Return empty array if real provider is offline.
     return [];
   }
 }

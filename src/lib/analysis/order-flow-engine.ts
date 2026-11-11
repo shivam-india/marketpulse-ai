@@ -27,9 +27,9 @@ export function computeOrderFlowAnalysis(
           divergenceDetected: false,
         },
         volumeProfile: {
-          poc: bars[bars.length - 1].close,
-          vah: bars[bars.length - 1].high,
-          val: bars[bars.length - 1].low,
+          poc: bars && bars.length > 0 ? bars[bars.length - 1].close : asset.currentPrice,
+          vah: bars && bars.length > 0 ? bars[bars.length - 1].high : asset.currentPrice * 1.005,
+          val: bars && bars.length > 0 ? bars[bars.length - 1].low : asset.currentPrice * 0.995,
           highVolumeNodes: [],
           lowVolumeNodes: [],
         },

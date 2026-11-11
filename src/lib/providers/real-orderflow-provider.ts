@@ -22,30 +22,37 @@ export interface RealOrderFlowResult {
 export async function fetchRealOrderFlowAndDepth(asset: AssetInfo): Promise<RealOrderFlowResult> {
   const symbol = asset.symbol.toUpperCase().replace(/\s+/g, "");
 
-  // Crypto pairs supported via Binance Level 2 DOM & Trade Flow
-  const binanceMap: Record<string, string> = {
-    "BTC/USD": "BTCUSDT",
-    "BTCUSD": "BTCUSDT",
-    "ETH/USD": "ETHUSDT",
-    "ETHUSD": "ETHUSDT",
-    "SOL/USD": "SOLUSDT",
-    "SOLUSD": "SOLUSDT",
+  const cryptoMap: Record<string, { binance: string; coinbase: string }> = {
+    "BTC/USD": { binance: "BTCUSDT", coinbase: "BTC-USD" },
+    "BTCUSD": { binance: "BTCUSDT", coinbase: "BTC-USD" },
+    "ETH/USD": { binance: "ETHUSDT", coinbase: "ETH-USD" },
+    "ETHUSD": { binance: "ETHUSDT", coinbase: "ETH-USD" },
+    "SOL/USD": { binance: "SOLUSDT", coinbase: "SOL-USD" },
+    "SOLUSD": { binance: "SOLUSDT", coinbase: "SOL-USD" },
   };
 
-  const binancePair = binanceMap[symbol];
+  const pairConfig = cryptoMap[symbol];
 
-  if (binancePair) {
+  if (pairConfig) {
+    // 1. Try Coinbase Pro Live L2 DOM & Trades (Global & US/Vercel compatible)
     try {
-      const [depthRes, tradesRes] = await Promise.all([
-        fetch(`https://api.binance.com/api/v3/depth?symbol=${binancePair}&limit=50`, { next: { revalidate: 3 } }),
-        fetch(`https://api.binance.com/api/v3/aggTrades?symbol=${binancePair}&limit=100`, { next: { revalidate: 3 } }),
+      const [cbDepthRes, cbTradesRes] = await Promise.all([
+        fetch(`https://api.exchange.coinbase.com/products/${pairConfig.coinbase}/book?level=2`, {
+          headers: { "User-Agent": "MarketPulse-AI" },
+          next: { revalidate: 3 },
+          signal: AbortSignal.timeout(3000),
+        }),
+        fetch(`https://api.exchange.coinbase.com/products/${pairConfig.coinbase}/trades?limit=100`, {
+          headers: { "User-Agent": "MarketPulse-AI" },
+          next: { revalidate: 3 },
+          signal: AbortSignal.timeout(3000),
+        }),
       ]);
 
-      if (depthRes.ok && tradesRes.ok) {
-        const depth = await depthRes.json();
-        const trades: any[] = await tradesRes.json();
+      if (cbDepthRes.ok && cbTradesRes.ok) {
+        const depth = await cbDepthRes.json();
+        const trades: any[] = await cbTradesRes.json();
 
-        // 1. Calculate Real L2 Liquidity & Order Book DOM
         let bidLiquidityUSD = 0;
         const bids = (depth.bids || []).slice(0, 15).map(([p, q]: [string, string]) => {
           const price = parseFloat(p);
@@ -68,21 +75,19 @@ export async function fetchRealOrderFlowAndDepth(asset: AssetInfo): Promise<Real
         const bestAsk = asks[0]?.price || asset.currentPrice;
         const spread = Number((bestAsk - bestBid).toFixed(asset.decimals));
 
-        // 2. Calculate Real Aggressive Trade Order Flow & Delta
         let buyQty = 0;
         let sellQty = 0;
         const priceBuckets = new Map<number, { buy: number; sell: number; total: number }>();
 
         for (const t of trades) {
-          const price = parseFloat(t.p);
-          const qty = parseFloat(t.q);
-          const isSell = t.m; // buyer was maker = aggressive market sell hitting bid
-          const isBuy = !t.m; // buyer was taker = aggressive market buy lifting ask
+          const price = parseFloat(t.price);
+          const qty = parseFloat(t.size);
+          const isBuy = t.side === "buy"; // Taker lifted the ask
+          const isSell = t.side === "sell"; // Taker hit the bid
 
           if (isBuy) buyQty += qty;
           if (isSell) sellQty += qty;
 
-          // Round to nearest price bucket for footprint
           const bucketPrice = Number(price.toFixed(asset.decimals <= 2 ? 1 : 2));
           const existing = priceBuckets.get(bucketPrice) || { buy: 0, sell: 0, total: 0 };
           if (isBuy) existing.buy += qty;
@@ -96,13 +101,149 @@ export async function fetchRealOrderFlowAndDepth(asset: AssetInfo): Promise<Real
         const buyPressurePercent = totalVol > 0 ? Math.round((buyQty / totalVol) * 100) : 50;
         const sellPressurePercent = 100 - buyPressurePercent;
 
-        // Volume Profile POC from real trades
         const sortedBuckets = Array.from(priceBuckets.entries()).sort((a, b) => b[1].total - a[1].total);
         const poc = sortedBuckets[0] ? sortedBuckets[0][0] : asset.currentPrice;
         const highVolumeNodes = sortedBuckets.slice(0, 3).map(([p]) => p);
         const lowVolumeNodes = sortedBuckets.slice(-3).map(([p]) => p);
 
-        // Real footprint bar generated from actual transaction delta
+        const footprintLevels = sortedBuckets.slice(0, 8).map(([price, data]) => ({
+          price,
+          bidVolume: Number(data.sell.toFixed(3)),
+          askVolume: Number(data.buy.toFixed(3)),
+          totalVolume: Number(data.total.toFixed(3)),
+          delta: Number((data.buy - data.sell).toFixed(3)),
+          imbalanceBuy: data.buy > data.sell * 2.5 && data.buy > 0.5,
+          imbalanceSell: data.sell > data.buy * 2.5 && data.sell > 0.5,
+        }));
+
+        const nowSec = Math.floor(Date.now() / 1000);
+        const footprintBars: OrderFlowFootprintBar[] = [
+          {
+            time: nowSec,
+            priceLevels: footprintLevels,
+            totalBid: Number(sellQty.toFixed(3)),
+            totalAsk: Number(buyQty.toFixed(3)),
+            barDelta: Number(netDelta.toFixed(3)),
+            cumulativeDelta: Number(netDelta.toFixed(3)),
+            pocPrice: poc,
+            valueAreaHigh: Math.max(...highVolumeNodes, poc),
+            valueAreaLow: Math.min(...highVolumeNodes, poc),
+          },
+        ];
+
+        return {
+          isAvailable: true,
+          providerName: "Coinbase Exchange Live L2 DOM & Trades",
+          orderFlow: {
+            isAvailable: true,
+            sourceNote: `Live Level 2 DOM and Trade Delta verified directly from Coinbase institutional order book for ${asset.symbol}.`,
+            cumulativeDeltaSummary: {
+              periodDelta: Number(netDelta.toFixed(4)),
+              trend: netDelta > 0 ? "accumulating" : netDelta < 0 ? "distributing" : "neutral",
+              divergenceDetected: false,
+            },
+            volumeProfile: {
+              poc,
+              vah: Math.max(...highVolumeNodes, poc),
+              val: Math.min(...highVolumeNodes, poc),
+              highVolumeNodes,
+              lowVolumeNodes,
+            },
+            aggression: {
+              buyPressurePercent,
+              sellPressurePercent,
+              recentImbalanceSpike: Math.abs(netDelta) > totalVol * 0.35,
+            },
+          },
+          footprintBars,
+          liquidity: {
+            isAvailable: true,
+            providerName: "Coinbase L2 Depth Stream",
+            bidLiquidityUSD: Math.round(bidLiquidityUSD),
+            askLiquidityUSD: Math.round(askLiquidityUSD),
+            bestBid,
+            bestAsk,
+            spread,
+            bids,
+            asks,
+            notice: "Real-time Level 2 order book depth of market (DOM) from Coinbase Exchange.",
+          },
+        };
+      }
+    } catch {
+      // Fall through to Binance if Coinbase fails
+    }
+
+    // 2. Try Binance Live L2 DOM & Trades (Global)
+    try {
+      const [depthRes, tradesRes] = await Promise.all([
+        fetch(`https://api.binance.com/api/v3/depth?symbol=${pairConfig.binance}&limit=50`, {
+          next: { revalidate: 3 },
+          signal: AbortSignal.timeout(3000),
+        }),
+        fetch(`https://api.binance.com/api/v3/aggTrades?symbol=${pairConfig.binance}&limit=100`, {
+          next: { revalidate: 3 },
+          signal: AbortSignal.timeout(3000),
+        }),
+      ]);
+
+      if (depthRes.ok && tradesRes.ok) {
+        const depth = await depthRes.json();
+        const trades: any[] = await tradesRes.json();
+
+        let bidLiquidityUSD = 0;
+        const bids = (depth.bids || []).slice(0, 15).map(([p, q]: [string, string]) => {
+          const price = parseFloat(p);
+          const quantity = parseFloat(q);
+          const totalUSD = price * quantity;
+          bidLiquidityUSD += totalUSD;
+          return { price, quantity, totalUSD };
+        });
+
+        let askLiquidityUSD = 0;
+        const asks = (depth.asks || []).slice(0, 15).map(([p, q]: [string, string]) => {
+          const price = parseFloat(p);
+          const quantity = parseFloat(q);
+          const totalUSD = price * quantity;
+          askLiquidityUSD += totalUSD;
+          return { price, quantity, totalUSD };
+        });
+
+        const bestBid = bids[0]?.price || asset.currentPrice;
+        const bestAsk = asks[0]?.price || asset.currentPrice;
+        const spread = Number((bestAsk - bestBid).toFixed(asset.decimals));
+
+        let buyQty = 0;
+        let sellQty = 0;
+        const priceBuckets = new Map<number, { buy: number; sell: number; total: number }>();
+
+        for (const t of trades) {
+          const price = parseFloat(t.p);
+          const qty = parseFloat(t.q);
+          const isSell = t.m;
+          const isBuy = !t.m;
+
+          if (isBuy) buyQty += qty;
+          if (isSell) sellQty += qty;
+
+          const bucketPrice = Number(price.toFixed(asset.decimals <= 2 ? 1 : 2));
+          const existing = priceBuckets.get(bucketPrice) || { buy: 0, sell: 0, total: 0 };
+          if (isBuy) existing.buy += qty;
+          if (isSell) existing.sell += qty;
+          existing.total += qty;
+          priceBuckets.set(bucketPrice, existing);
+        }
+
+        const netDelta = buyQty - sellQty;
+        const totalVol = buyQty + sellQty;
+        const buyPressurePercent = totalVol > 0 ? Math.round((buyQty / totalVol) * 100) : 50;
+        const sellPressurePercent = 100 - buyPressurePercent;
+
+        const sortedBuckets = Array.from(priceBuckets.entries()).sort((a, b) => b[1].total - a[1].total);
+        const poc = sortedBuckets[0] ? sortedBuckets[0][0] : asset.currentPrice;
+        const highVolumeNodes = sortedBuckets.slice(0, 3).map(([p]) => p);
+        const lowVolumeNodes = sortedBuckets.slice(-3).map(([p]) => p);
+
         const footprintLevels = sortedBuckets.slice(0, 8).map(([price, data]) => ({
           price,
           bidVolume: Number(data.sell.toFixed(3)),
@@ -167,8 +308,8 @@ export async function fetchRealOrderFlowAndDepth(asset: AssetInfo): Promise<Real
           },
         };
       }
-    } catch (err) {
-      console.warn("Binance live order flow error:", err);
+    } catch {
+      // Fall through to unavailable
     }
   }
 
@@ -212,4 +353,3 @@ export async function fetchRealOrderFlowAndDepth(asset: AssetInfo): Promise<Real
     },
   };
 }
-

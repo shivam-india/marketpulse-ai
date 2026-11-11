@@ -181,7 +181,7 @@ export function calculateSupportResistanceClusters(
   timeframe: Timeframe,
   tolerancePercent = 0.003
 ): { support: SupportResistanceLevel[]; resistance: SupportResistanceLevel[] } {
-  const currentPrice = bars[bars.length - 1].close;
+  const currentPrice = bars && bars.length > 0 ? bars[bars.length - 1].close : (pivots[0]?.price || 1.0);
   const highPivots = pivots.filter((p) => p.type === "HH" || p.type === "LH");
   const lowPivots = pivots.filter((p) => p.type === "HL" || p.type === "LL");
 
@@ -241,6 +241,28 @@ export function analyzeMarketStructure(
   bars: OHLCV[],
   timeframe: Timeframe = "15m"
 ): TechnicalAnalysisSummary {
+  if (!bars || bars.length === 0) {
+    const defaultIndicators = computeTechnicalIndicators([]);
+    return {
+      trend: "ranging",
+      marketStructure: {
+        state: "consolidation",
+        points: [],
+        breaks: [],
+        fvgList: [],
+        supportLevels: [],
+        resistanceLevels: [],
+      },
+      indicators: defaultIndicators,
+      signals: {
+        emaAlignment: "neutral",
+        rsiStatus: "neutral",
+        macdStatus: "neutral",
+        volatilityStatus: "normal",
+      },
+    };
+  }
+
   const currentPrice = bars[bars.length - 1].close;
   const indicators = computeTechnicalIndicators(bars);
   const pivots = identifySwingPivots(bars);
